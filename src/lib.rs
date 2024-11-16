@@ -7,7 +7,7 @@
 #![cfg_attr(not(feature = "export-abi"), no_main)]
 extern crate alloc;
 
-use alloy_primitives::Address;
+use alloy_primitives::{address, Address};
 use alloy_sol_types::sol;
 /// Import items from the SDK. The prelude contains common traits and macros.
 use stylus_sdk::{alloy_primitives::U256, msg, prelude::*, storage::{StorageAddress, StorageBool, StorageMap, StorageU256, StorageVec}};
@@ -58,6 +58,7 @@ struct PredictionPool{
 pub struct PredictionContract{
     initialized: StorageBool,
     owner: StorageAddress,
+    this_address: StorageAddress,
     player_info_smart_contract_address: StorageAddress,
     match_info_smart_contract_address: StorageAddress,
     prediction_pools: StorageMap<U256, PredictionPool> //Match ID -> Prediction Pool
@@ -95,6 +96,15 @@ impl PredictionContract{
         Ok(())
     }
 
+    fn get_this_address(&self) -> Address{
+        self.this_address.get()
+    }
+
+    fn set_this_address(&mut self, this_address: Address) -> Result<(), Vec<u8>>{
+        self.this_address.set(this_address);
+        Ok(())
+    }
+
     // Match Info Smart Contract Triggers this function so other people can view this
     fn create_prediction_pool(&mut self, match_id: U256) -> Result<(), Vec<u8>>{
         let initialized = self.initialized.get();
@@ -112,6 +122,77 @@ impl PredictionContract{
         prediction_pool_setter.player1_pool_stake.set(U256::from(0));
         prediction_pool_setter.player2_pool_stake.set(U256::from(0));
         prediction_pool_setter.total_staked.set(U256::from(0));
+
+        Ok(())
+    }
+
+    // predict match function
+    // allows the user to stake USDC token on a match
+    #[payable]
+    fn predict_match(&mut self, match_id: U256, party: U256, usdc_amount: U256) -> Result<(), Vec<u8>>{
+        let initialized  = self.initialized.get();
+        if !initialized {
+            return Err("The contract has not been initialized".into());
+        }
+
+        let match_info_smart_contract_address = self.match_info_smart_contract_address.get();
+        if msg::sender() != match_info_smart_contract_address{
+            return Err("Only the match info smart contract can create a prediction pool".into());
+        }
+
+        if party != U256::from(1) && party != U256::from(2) {
+            return Err("Invalid party".into());
+        }
+
+        let match_pool = self.prediction_pools.get(match_id);
+        if !match_pool.exists.get() {
+            return Err("The match does not exist".into());
+        }
+
+        for i in 0..match_pool.player1_predictor.len() {
+            if match_pool.player1_predictor.get(i).unwrap() == msg::sender() {
+                return Err("You have already predicted in this match".into());
+            }
+        }
+
+        for i in 0..match_pool.player2_predictor.len() {
+            if match_pool.player2_predictor.get(i).unwrap() == msg::sender() {
+                return Err("You have already predicted in this match".into());
+            }
+        }
+
+        let this_address = self.this_address.get();
+        let player1_pool_stake = match_pool.player1_pool_stake.get();
+        let player2_pool_stake = match_pool.player2_pool_stake.get();
+        let old_staked_amount = match_pool.total_staked.get();
+        let new_stake_amount = msg::value();
+        let player1_predictor_count = match_pool.player1_predictor_count.get();
+        let player2_predictor_count = match_pool.player2_predictor_count.get();
+        drop(match_pool);
+
+        let mut match_pool_setter = self.prediction_pools.setter(match_id);
+        
+        match_pool_setter.total_staked.set(old_staked_amount + new_stake_amount);
+        if party == U256::from(1){
+            match_pool_setter.player1_predictor.push(msg::sender());
+            match_pool_setter.player1_predictor_stake.push(new_stake_amount);
+            match_pool_setter.player1_pool_stake.set(player1_pool_stake + new_stake_amount);
+            match_pool_setter.player1_predictor_count.set(player1_predictor_count + U256::from(1));
+        }else{
+            match_pool_setter.player2_predictor.push(msg::sender());
+            match_pool_setter.player2_predictor_stake.push(new_stake_amount);
+            match_pool_setter.player2_pool_stake.set(player2_pool_stake + new_stake_amount);
+            match_pool_setter.player2_predictor_count.set(player2_predictor_count + U256::from(1));
+        }
+
+        // Transfer USDC token from the user to the contract
+        //let mut self_reference = &*self;
+        //put at the last because transfer_from consume everything
+        let transfer_result = IERC20::new(USDC_TOKEN_ADDRESS).transfer_from(self, msg::sender(), this_address, usdc_amount);
+        if transfer_result.is_err(){
+           return Err("USDC Staking has failed. Prediction Plaement has been reverted".into());
+           //if payment fails, the prediction will be reverted
+        }
 
         Ok(())
     }
