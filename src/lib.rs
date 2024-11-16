@@ -35,11 +35,16 @@ sol_interface! {
             external
             returns (bool);
     }
+
+    interface IPlayerInfoContract{
+        function addPredictionResults(address player_address, bool was_won) external;
+    }
 }
 
 #[storage]
 struct PredictionPool{
     exists: StorageBool,
+    stakable: StorageBool,
 
     player1_predictor_count: StorageU256,
     player1_predictor : StorageVec<StorageAddress>,
@@ -63,7 +68,6 @@ pub struct PredictionContract{
     player_info_smart_contract_address: StorageAddress,
     match_info_smart_contract_address: StorageAddress,
     prediction_pools: StorageMap<U256, PredictionPool>,  //Match ID -> Prediction Pool
-    withdrawable_pool: StorageMap<Address, StorageU256> //User Address -> Withdrawable Amount of USDC after winning predictions
 }
 
 #[public]
@@ -121,9 +125,34 @@ impl PredictionContract{
 
         let mut prediction_pool_setter = self.prediction_pools.setter(match_id);
         prediction_pool_setter.exists.set(true);
+        prediction_pool_setter.stakable.set(true);
         prediction_pool_setter.player1_pool_stake.set(U256::from(0));
         prediction_pool_setter.player2_pool_stake.set(U256::from(0));
         prediction_pool_setter.total_staked.set(U256::from(0));
+
+        Ok(())
+    }
+
+    /// Stop allowing prediction for a match
+    /// This will happens when a match has been started by the server
+    fn stop_allow_prediction(&mut self, match_id: U256) -> Result<(), Vec<u8>>{
+        let initialized = self.initialized.get();
+        if !initialized {
+            return Err("The contract has not been initialized".into());
+        }
+
+        let match_info_smart_contract_address = self.match_info_smart_contract_address.get();
+        if msg::sender() != match_info_smart_contract_address{
+            return Err("Only the match info smart contract can create a prediction pool".into());
+        }
+
+        let match_pool = self.prediction_pools.get(match_id);
+        if !match_pool.exists.get() {
+            return Err("The match does not exist".into());
+        }
+
+        let mut match_pool_setter = self.prediction_pools.setter(match_id);
+        match_pool_setter.stakable.set(false);
 
         Ok(())
     }
@@ -149,6 +178,10 @@ impl PredictionContract{
         let match_pool = self.prediction_pools.get(match_id);
         if !match_pool.exists.get() {
             return Err("The match does not exist".into());
+        }
+
+        if !match_pool.stakable.get() {
+            return Err("Prediction Staking has been stopped for this match".into());
         }
 
         for i in 0..match_pool.player1_predictor.len() {
@@ -213,7 +246,7 @@ impl PredictionContract{
     // and distribute the rewards to the winners
     // the rewards are distributed based on the proportion of the total stake
     // it will be put into a withdrawal pool where the user can request for withdrawal as calling transfer_usdc is somehow not working for continuously loop
-    fn submit_match_result(&mut self, match_id: U256, winner: U256) -> Result<(), Vec<u8>>{
+    fn submit_match_results(&mut self, match_id: U256, winner: U256) -> Result<(), Vec<u8>>{
         let initialized = self.initialized.get();
         if !initialized {
             return Err("The contract has not been initialized just yet".into());
@@ -234,6 +267,10 @@ impl PredictionContract{
         }
 
         let total_staked = match_pool.total_staked.get();
+        //take 5% cut from the total staked
+        let cut = (total_staked * U256::from(5)) / U256::from(100);
+        let total_staked_after_cut = total_staked - cut;
+
         drop(match_pool);
         
         if winner == U256::from(1) {     
@@ -241,22 +278,47 @@ impl PredictionContract{
             for i in 0..self.prediction_pools.get(match_id).player1_predictor.len() {
                 let predictor = self.prediction_pools.get(match_id).player1_predictor.get(i).unwrap();
                 let predictor_stake = self.prediction_pools.get(match_id).player1_predictor_stake.get(i).unwrap();
-                let reward = (predictor_stake * total_staked) / winner_total_staked;
+                let reward = (predictor_stake * total_staked_after_cut) / winner_total_staked;
 
-                let old_withdrawable_amount = self.withdrawable_pool.get(predictor);
-                let mut withdrawable_pool_setter = self.withdrawable_pool.setter(predictor);
-                withdrawable_pool_setter.set(old_withdrawable_amount + reward);
+                if self.send_usdc(predictor, reward).is_err(){
+                    return Err("Transfer failed".into());
+                }
+
+                //update the stats for the predictor
+                if self.update_prediction_stats(predictor, true).is_err(){
+                    return Err("Updating Prediction Stats failed".into());
+                }
             }
+
+            //update the stats for losers as well
+            for i in 0..self.prediction_pools.get(match_id).player2_predictor.len() {
+                let predictor = self.prediction_pools.get(match_id).player2_predictor.get(i).unwrap();
+                if self.update_prediction_stats(predictor, false).is_err(){
+                    return Err("Updating Prediction Stats failed".into());
+                }
+            }
+
         }else{
             let winner_total_staked = self.prediction_pools.get(match_id).player2_pool_stake.get();
             for i in 0..self.prediction_pools.get(match_id).player2_predictor.len() {
                 let predictor = self.prediction_pools.get(match_id).player2_predictor.get(i).unwrap();
                 let predictor_stake = self.prediction_pools.get(match_id).player2_predictor_stake.get(i).unwrap();
-                let reward = (predictor_stake * total_staked) / winner_total_staked;
+                let reward = (predictor_stake * total_staked_after_cut) / winner_total_staked;
                 
-                let old_withdrawable_amount = self.withdrawable_pool.get(predictor);
-                let mut withdrawable_pool_setter = self.withdrawable_pool.setter(predictor);
-                withdrawable_pool_setter.set(old_withdrawable_amount + reward);
+                if self.send_usdc(predictor, reward).is_err(){
+                    return Err("Transfer failed".into());
+                }
+
+                if self.update_prediction_stats(predictor, true).is_err(){
+                    return Err("Updating Prediction Stats failed".into());
+                }
+            }
+
+            for i in 0..self.prediction_pools.get(match_id).player1_predictor.len() {
+                let predictor = self.prediction_pools.get(match_id).player1_predictor.get(i).unwrap();
+                if self.update_prediction_stats(predictor, false).is_err(){
+                    return Err("Updating Prediction Stats failed".into());
+                }
             }
         }
 
@@ -270,6 +332,9 @@ impl PredictionContract{
 
     }
 
+    // allows the user to see how much USDC they can withdraw after winning the prediction matches
+
+    /*
     fn withdraw_rewards(&mut self) -> Result<(), Vec<u8>>{
         let initialized = self.initialized.get();
         if !initialized {
@@ -289,6 +354,24 @@ impl PredictionContract{
             return Err("Transfer failed".into());
         }
 
+        Ok(())
+    }*/
+}
+
+impl PredictionContract{
+    fn send_usdc(&mut self, to: Address, amount: U256) -> Result<(), Vec<u8>>{
+        let transfer_result = IERC20::new(USDC_TOKEN_ADDRESS).transfer(self,  to, amount);
+        if transfer_result.is_err(){
+            return Err("Transfer failed".into());
+        }
+        Ok(())
+    }
+
+    fn update_prediction_stats(&mut self, player_address: Address, was_won: bool) -> Result<(), Vec<u8>>{
+        let player_info_contract: IPlayerInfoContract = IPlayerInfoContract::new(self.player_info_smart_contract_address.get());
+        if player_info_contract.add_prediction_results(self,player_address, was_won).is_err(){
+            return Err("Updating Prediction Stats failed".into());
+        }
         Ok(())
     }
 }
