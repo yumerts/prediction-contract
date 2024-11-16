@@ -166,11 +166,6 @@ impl PredictionContract{
             return Err("The contract has not been initialized".into());
         }
 
-        let match_info_smart_contract_address = self.match_info_smart_contract_address.get();
-        if msg::sender() != match_info_smart_contract_address{
-            return Err("Only the match info smart contract can create a prediction pool".into());
-        }
-
         if party != U256::from(1) && party != U256::from(2) {
             return Err("Invalid party".into());
         }
